@@ -1,0 +1,15 @@
+{
+	"name": "pi-cache-match-extension",
+	"version": "0.1.0",
+	"description": "Pi/pi-mono framework extension that predicts KV-cache (prefix-cache) match for every completion call, attributes it to agents/subagents/sessions, diagnoses cache breaks, and emits routing-ready cache-affinity telemetry.",
+	"type": "module",
+	"license": "MIT",
+	"pi": {
+		"extensions": ["./src/index.ts"]
+	},
+	"dependencies": {
+		"@earendil-works/pi-agent-core": "^0.84.2",
+		"@earendil-works/pi-coding-agent": "^0.84.2",
+		"typebox": "^1.3.7"
+	}
+}
