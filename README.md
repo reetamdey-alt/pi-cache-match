@@ -1,4 +1,4 @@
-# pi-cache-match — Technical & Mathematical Reference
+# pi-cache-match 
 
 A **pi agent-runtime extension** that answers, for **every** LLM completion call:
 
