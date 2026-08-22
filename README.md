@@ -12,6 +12,248 @@ Implementation authority: `/tmp/pi-cache-match-work/src` (mirrored to the live i
 
 ---
 
+## 0. Visual architecture at a glance
+
+Nine diagrams. Read top-to-bottom; together they tell the entire story before a single formula.
+
+### 0.A  Where this extension sits — the big picture
+
+```
+ ┌──────────────────────────────────────────────────────────────────────────────┐
+ │                         pi / xyne-cli  agent runtime                          │
+ │                                                                              │
+ │  user ──► agent ──► turn ──► subagent ──► tool calls ──► build request       │
+ │                                  │                                          │
+ │      ╔═══════════════════════════╧═══════════════════════════════╗           │
+ │      ║           pi-cache-match  (THIS extension)                ║           │
+ │      ║   observe-only hooks:                                     ║           │
+ │      ║     before_provider_request ──► fingerprint & LCP          ║           │
+ │      ║     message_end             ──► reconcile & emit           ║           │
+ │      ║     agent_/turn_/session_* ──► cascade attribution         ║           │
+ │      ╚═══════════════════════════╤═══════════════════════════════╝           │
+ │                                  │ one JSONL line per call                   │
+ └──────────────────────────────────┼───────────────────────────────────────────┘
+                                    ▼
+                    {org}-{app}-{agent}.jsonl   +   _fingerprint-index.jsonl
+                                    │
+                                    ▼
+                    provider wire ──► usage.cacheRead  (ground truth, reconciled)
+```
+
+The extension **never leads** — it *rides* the same request the agent was already going to send, fingerprints it, and compares the chain against the previous one. Nothing the agent or provider sees is altered.
+
+### 0.B  One call, end-to-end — the six-stage pipeline
+
+```
+  RENDERED PROMPT  (system + tools + messages, exact wire bytes)
+        │
+        ▼
+ ┌──────────────────────┐     ┌──────────────────────┐
+ │  ACTUAL   prompt     │     │  CANONICAL twin      │   normalizeVolatileContent:
+ │  (what model sees)   │     │  (volatility scrubbed)│   timestamps→[TIMESTAMP], uuids→[UUID],
+ └─────────┬────────────┘     └─────────┬────────────┘   ids→[ID], hex→[HASH], epochs→[UNIX_TS]
+           ▼                            ▼
+      tokenise 4 chars/token FNV32  (both tracks)
+           ▼                            ▼
+      split ⌊T/16⌋ full blocks + partial tail (backends cache full pages only)
+           ▼                            ▼
+      Merkle-chained hashBlock  Gᵢ = H(context ‖ Gᵢ₋₁ ‖ tokensᵢ)
+           ▼                            ▼
+      ┌────────────────────────────────────────┐
+      │   LCP  prevChain �matches curChain      │   string equality, break at first diff
+      │        matchedBlocks = #leading equals  │
+      └──────────────────┬─────────────────────┘
+                         ▼
+        ┌─────────────────────────────────────┐
+        │  percentages:                       │
+        │    tokenMatchPct  = matched·16 / T  │   (≤ blockMatchPct always — partial tail dilutes)
+        │    blockMatchPct  = matched / n_full│
+        │    predicted_match_pct  = token     │
+        │    cache_affinity_score = block     │
+        └──────────────────┬──────────────────┘
+                         ▼
+        provider responds ──► usage { input, cacheRead }
+                         ▼
+        ┌─────────────────────────────────────┐
+        │  RECONCILE:                         │
+        │    actual hit% = cacheRead          │
+        │                  ─────────────      │
+        │                  input+cacheRead    │
+        │    delta       = cacheRead − predictedMatchedTokens   (actual − predicted)
+        │    source      = hybrid | pi_prediction              │
+        └──────────────────┬──────────────────┘
+                         ▼
+        one JSONL event emitted (hashes + counters only — NO content ever)
+```
+
+### 0.C  Anatomy of one block fingerprint — why one string compare is enough
+
+```
+ context commitment (same for every block of this call):
+   H( fp_v | model | tok_v | tpl_v | cacheNamespace | H_extra(special keys) )
+
+ chain:
+   G₀   = "0000000000000000"
+   Gᵢ   = H( context ‖ Gᵢ₋₁ ‖ join(",", tokens[i·16 .. i·16+15]) )
+
+                        what Gᵢ COMMITS TO
+ Gᵢ ───────────────────────────────────────────────────────────┐
+                                                                ▼
+ prefix identity:      (fp_v, model, tok_v, tpl_v, namespace)
+                  +    the whole token prefix 0 .. 16(i+1)−1
+                  +    the exact position i
+
+ ⟹  Gᵢ_prev === Gᵢ_cur   IFF   both calls agree on context AND byte-prefix AND position
+ ⟹  LCP is a plain string compare — the chain pre-digested the whole comparison
+```
+
+### 0.D  Cache-break diagnosis — the decision tree
+
+```
+                 (previous chain exists) ∧ (matched < n_full)
+                              │
+        ┌─────────────────────┼───────────────────────────────┐
+        ▼                     ▼                               ▼
+   isAppend?           system-history path             ¬isAppend & has segment
+ matched ≥ prev−1       (no prompt segment)                (seg.source set)
+        │                     │                               │
+       YES:                   │                ┌──────────────┼───────────────┐
+   no reason set              ▼                ▼              ▼               ▼
+ (diagnosis_note =      matched==0 ∧      source="prompt"  has [TIMESTAMP]  else
+  "prompt grew by N      prev[0]≠cur[0]      ⇒ system_        ⇒ volatility    ⇒ history_
+   trailing block(s)")   ∧ systemPromptLen>0  prompt_change     (timestamps)     rewrite
+                         ⇒ system_prompt_
+                           change (structural)
+                              │
+                              ▼
+              (any reason still null? ∧ matched==0 ∧ prev[0]≠cur[0])
+                                  ⇒ session_restart   (fallback)
+
+   + ALWAYS:  cacheClobberingDetected  independent flag (§2.8)
+              matched==0 ∧ priorBest ≥ 4·B=64 ⇒ clobbering + expected_tokens
+```
+
+The fix that matters most: **`isAppend = matched ≥ len−1`** absorbs the straddling block that spans prev-tail/new-head bytes — a pure append *cannot* produce a same hash there. Without it, round-14 showed `history_rewrite` firing falsely on every benign turn.
+
+### 0.E  The two percentages — same match, two honest answers
+
+Use the lineage from §3 (the round-5 live turn): `prev = 31 blocks`, `cur = 36 blocks`, `T = 577` tokens ⇒ `n_full = 36`, `tail = 577 − 36·16 = 1` token.
+
+```
+ prompt:  [████████████████ … ████████████████ | ▏]
+           block 0 …………… block 35         tail
+           ◄────────── 31 matched ──────────────►
+
+ blockMatchPct  = matched / n_full  = 31/36       = 0.8611   (page view)
+ tokenMatchPct  = matched·16 / T    = 31·16/577  = 496/577  = 0.8596   (token view)
+
+ 577  =  36·16 + 1      tail = 1 token
+        └──────┬─── 1-token dilution accounts for the 0.0015 gap ───┘
+```
+
+Two ratios, both correct: the dashboard wants token share of prompt-cost; the router wants page share of the prefix. `tokenMatchPct ≤ blockMatchPct` always (the partial-tail identity, §2.7).
+
+### 0.F  Clobbering vs cold start — timeline
+
+```
+ priorBest(tokens):    0 ─► 48 ─► 496 ─► 512 ─────────► 512 ─► 528
+ matched(tokens):     48 ─► 496 ─► 512 ─► 0(clobber!)──► 528 ─► 528
+                                              ▲
+                     detected: matched==0 ∧ priorBest ≥ 64
+                     emitted:  cache_clobbering_detected=true,
+                               cache_clobbering_expected_tokens=512
+
+ cold start (priorBest=0, matched=0) → NOT clobbering — that's just warm-up
+```
+
+A *regression* and a *fresh start* must never share a code path — the `4·B` threshold separates them.
+
+### 0.G  Cross-process shard — why a fresh pid still knows the lineage
+
+```
+  process A (turn k)                        process B (turn k+1, new pid)
+  ─────────────────                         ───────────────────────────
+  compute chain G₀..G_{n-1}                 lazy-load _fingerprint-index.jsonl
+  persistFingerprint(root,   G₀..G_{n-1})        │
+  persistFingerprint(root#canonical, ... )       ▼
+  persistFingerprint(root#call, (k+1).toString(36))  seed callIndex ← #call
+        │                                          fetch root's chain ← in-memory map
+        ▼                                          │
+   shard on disk (_fingerprint-index.jsonl)         ▼
+   one line per write: {k, h:[hashes], t}       LCP against root chain
+   latest-per-key wins; compacted at 1000×512 B     matched = 31 / n_full = 36
+        │                                          │
+        └────────────► next pid's warm start ──────┘      call_index = k+1 (continues)
+```
+
+`#call` is base-36 — alphabet disjoint from the 16-hex fingerprints, guaranteed never to collide in LCP space.
+
+### 0.H  Cascade attribution — the call stack shapes the event
+
+```
+ session_start          turn_start          agent_start         agent_start
+      │                     │                   │                   │
+      ▼                     ▼                   ▼                   ▼
+ stack:  []              [turn]            [turn,agent]      [turn,agent,agent]
+                │                  │                  │
+                ▼                  ▼                  ▼
+ callType   agent_turn     root_user_turn        subagent
+ depth      0              1                     2
+ trace_id   rootCallId     rootCallId            rootCallId  (shared across the run)
+```
+
+`depth = #(live agent frames)`; `turn` frames contribute the turn id but not depth. A nested subagent is traceable to the outermost agent frame via `trace_id = root_call_id`.
+
+### 0.I  Metric realism map — what's exact, what's approximate, what's absent
+
+```
+                        ┌─ EXACT ────────────────────────────────────────────┐
+  ratios (token, block, │   deterministic LCP over the rendered prompt — bit-│
+  affinity, matched_from)│   correct prefix commit via hash chain              │
+                        └────────────────────────────────────────────────────┘
+
+                        ┌─ REAL, verbatim from wire ─────────────────────────┐
+  usage_input/cacheRead │   provider's own counter — ground truth            │
+  session/trace/call ids│   from sessionManager + the cascade stack          │
+                        └────────────────────────────────────────────────────┘
+
+                        ┌─ APPROXIMATE (flagged confidence=low) ─────────────┐
+  absolute token counts │   4 chars/token heuristic — ratios exact, counts   │
+                        │   within ~15% of real BPE; NEVER polished into "exact"│
+                        └────────────────────────────────────────────────────┘
+
+                        ┌─ ABSENT, never fabricated ─────────────────────────┐
+  ttft_ms, prefill_ms,  │   pi doesn't expose them — scenario X asserts absence│
+  selected_replica, …   │                                                    │
+                        └────────────────────────────────────────────────────┘
+```
+
+Every emitted number carries its epistemic status. No estimate is ever dressed up as a measurement.
+
+### 0.J  The self-audit pyramid
+
+```
+              tooling artefacts
+            ┌─────────────────────────────────────────────────┐
+            │  live e2e: pi-mono × kimi-latest + xyne × glm  │   109 rows / 45 lanes
+            │  (rounds 13b–15) — 0 violations                │
+            └────────────┬────────────────────────────────────┘
+                         ▼
+            ┌─────────────────────────────────────────────────┐
+            │  fuzz: 26 scenarios (A–Z), 259 assertions        │   3000-call stress incl.
+            │  scenario Z: call_index strictly monotonic       │
+            └────────────┬────────────────────────────────────┘
+                         ▼
+            ┌─────────────────────────────────────────────────┐
+            │  this README: every formula verified against     │
+            │  authoritative source line-by-line (5 audits)    │
+            └─────────────────────────────────────────────────┘
+```
+
+Each layer tests the one beneath: fuzz tests formulas, live runs test the fuzz, this README keeps the whole tower honest.
+
+---
+
 ## Contents
 
 | # | Section | What you get |
