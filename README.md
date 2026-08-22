@@ -6,6 +6,94 @@ A **pi agent-runtime extension** that answers, for **every** LLM completion call
 
 It does this **before** the request leaves the process, purely from the framework layer, with **zero LLM calls, zero semantic similarity, zero GPU access** — only deterministic hashing and longest-common-prefix over block fingerprints. It then reconciles the prediction against the provider's real `usage.cacheRead` counter and emits one clean JSONL event per call.
 
+```
+╔═══════════════════════════════════════════════════════════════════════════════════════════╗
+║                                                                                           ║
+║                      turn-1 the agent sends   turn-2 the agent sends                      ║
+║                                                                                           ║
+║      prompt: "You are pi. [tools] user: a         prompt: "You are pi. [tools]            ║
+║               long question about x"                        user:  a long question         ║
+║                                                               about x. Then follow-up."   ║
+║                                                                                           ║
+║             ▼                                                              ▼              ║
+║   ┌──────────────────┐                                          ┌──────────────────┐       ║
+║   │ RENDER (exact    │                                          │ RENDER (exact    │       ║
+║   │ wire bytes)      │                                          │ wire bytes)      │       ║
+║   └────────┬─────────┘                                          └────────┬─────────┘       ║
+║            │                                                             │                ║
+║            ▼                                                             ▼                ║
+║   ┌──────────────────┐                                          ┌──────────────────┐       ║
+║   │ TOKENISE 4char   │                                          │ TOKENISE 4char   │       ║
+║   │ → FNV32 pseudo-ids│                                          │ → FNV32 pseudo-ids│      ║
+║   │ T = 577 tokens   │                                          │ T' = 593 tokens  │       ║
+║   └────────┬─────────┘                                          └────────┬─────────┘       ║
+║            │                                                             │                ║
+║            ▼                                                             ▼                ║
+║   ┌──────────────────┐                                          ┌──────────────────┐       ║
+║   │ SPLIT 16-token    │                                          │ SPLIT 16-token    │      ║
+║   │ blocks            │                                          │ blocks            │      ║
+║   │ n_full = 36       │                                          │ n_full = 37       │      ║
+║   │ tail    = 1       │                                          │ tail    =  1      │      ║
+║   └────────┬─────────┘                                          └────────┬─────────┘       ║
+║            │                                                             │                ║
+║            ▼                                                             ▼                ║
+║   ┌──────────────────┐                                          ┌──────────────────┐       ║
+║   │ CHAIN Gᵢ = H(     │                                          │ CHAIN Gᵢ = H(     │      ║
+║   │   ctx‖Gᵢ₋₁‖tokens)│                                          │   ctx‖Gᵢ₋₁‖tokens)│      ║
+║   │ prev=None (cold)  │                                          │ prev=stored turn-1│      ║
+║   └────────┬─────────┘                                          └────────┬─────────┘       ║
+║            │                                                             │                ║
+║            │                                                    ┌────────┴─────────┐       ║
+║            │                                                    ▼ LCP over chains  ▼       ║
+║            │                                            ┌───────────────────────┐          ║
+║            │                                            │ prev [h₀ h₁ … h₃₀]    │          ║
+║            │                                            │ cur  [h₀ h₁ … h₃₀ h₃₁…h₃₆] │      ║
+║            │                                            │       ↓↓↓↓↓↓↓↓↓↓↓  ✗  │          ║
+║            │                                            │       matched = 31 blocks        ║
+║            │                                            └──────────┬────────────┘           ║
+║            │                                                       │                        ║
+║            │                                                       ▼                        ║
+║            │                                            ┌───────────────────────┐          ║
+║            │                                            │ metric emissions       │          ║
+║            │                                            │  ├ tokenMatchPct      = 496/577 = 0.8596 ║
+║            │                                            │  ├ blockMatchPct      = 31/36   = 0.8611 ║
+║            │                                            │  ├ matched_from       = "actual"          ║
+║            │                                            │  ├ call_index         = 1                 ║
+║            │                                            │  └ confidence         = "low"  (4char/tok)║
+║            │                                            └──────────┬────────────┘           ║
+║            │                                                       │                        ║
+║            │                            provider (Anthropic/Kimi/OpenAI)                   ║
+║            │                            responds:                                            ║
+║            │                            usage.input = 81  (new only)                       ║
+║            │                            usage.cacheRead = 496 (your prefix hit)             ║
+║            │                                                       │                        ║
+║            │                                                       ▼                        ║
+║            │                                            ┌───────────────────────┐           ║
+║            │                                            │ RECONCILE              │           ║
+║            │                                            │  actual hit% = 496/577 = 0.8596  ║
+║            │                                            │  delta       = 496 − 496 = 0    ║
+║            │                                            │  source      = "hybrid"         ║
+║            │                                            └──────────┬────────────┘           ║
+║            │                                                       │                        ║
+║            │                            ┌──────────────────────────┼─────────────┐          ║
+║            │                            ▼                          ▼             ▼          ║
+║            │                          ┌─────────────────┐  ┌──────────────────┐ ┌────────┐ ║
+║            │                          │ {org}-{app}-     │  │ _fingerprint-    │ │ rollup │ ║
+║            │                          │ {agent}.jsonl    │  │   index.jsonl     │ │ (mem) │ ║
+║            │                          │   ↓ event         │  │   ↓ shard         │ └────────┘ ║
+║            │                          │  complete         │  │   call chain      │            ║
+║            │                          └─────────────────┘  └─────────┬───────┘            ║
+║            │                                                             │                ║
+║            └── persist chain for the next processes call                  │                ║
+║                 (so a fresh pid can pick-match exactly this chain)────────┘                ║
+║                                                                                           ║
+║         ⟹  the model never knows this extension ran; only the ops team benefits           ║
+║                                                                                           ║
+╚═══════════════════════════════════════════════════════════════════════════════════════════╝
+```
+
+*One diagram above shows everything the extension does for one call. Every subsystem in §0.A–0.J is one of these boxes or arrows.*
+
 Implementation authority: `/tmp/pi-cache-match-work/src` (mirrored to the live install `~/.pi/agent/extensions/pi-cache-match/src`). This README documents **the authority**, formula for formula. At the time of writing the two were `diff -rq` clean after every completed round except the **round-14** structural change (see note below), for which the install lags by one revision.
 
 > **Round-14 caveat (informational):** the workspace `src/index.ts` (1163 lines) carries the `isAppend = matchedBlocks >= previous.blockHashes.length - 1` straddle fix *plus* the `recon.systemPromptLen > 0` structural system-prompt catch. The live install (1125 lines) has the straddle fix only. The README documents the workspace (source of truth). A `rsync -a --delete` from the workspace to the install brings them into lockstep.
@@ -129,7 +217,7 @@ The extension **never leads** — it *rides* the same request the agent was alre
               (any reason still null? ∧ matched==0 ∧ prev[0]≠cur[0])
                                   ⇒ session_restart   (fallback)
 
-   + ALWAYS:  cacheClobberingDetected  independent flag (§2.8)
+   + ALWAYS:  cacheClobberingDetected  independent flag (§3.8)
               matched==0 ∧ priorBest ≥ 4·B=64 ⇒ clobbering + expected_tokens
 ```
 
@@ -137,7 +225,7 @@ The fix that matters most: **`isAppend = matched ≥ len−1`** absorbs the stra
 
 ### 0.E  The two percentages — same match, two honest answers
 
-Use the lineage from §3 (the round-5 live turn): `prev = 31 blocks`, `cur = 36 blocks`, `T = 577` tokens ⇒ `n_full = 36`, `tail = 577 − 36·16 = 1` token.
+Use the lineage from §4 (the round-5 live turn): `prev = 31 blocks`, `cur = 36 blocks`, `T = 577` tokens ⇒ `n_full = 36`, `tail = 577 − 36·16 = 1` token.
 
 ```
  prompt:  [████████████████ … ████████████████ | ▏]
@@ -151,7 +239,7 @@ Use the lineage from §3 (the round-5 live turn): `prev = 31 blocks`, `cur = 36 
         └──────┬─── 1-token dilution accounts for the 0.0015 gap ───┘
 ```
 
-Two ratios, both correct: the dashboard wants token share of prompt-cost; the router wants page share of the prefix. `tokenMatchPct ≤ blockMatchPct` always (the partial-tail identity, §2.7).
+Two ratios, both correct: the dashboard wants token share of prompt-cost; the router wants page share of the prefix. `tokenMatchPct ≤ blockMatchPct` always (the partial-tail identity, §3.7).
 
 ### 0.F  Clobbering vs cold start — timeline
 
@@ -246,7 +334,7 @@ Every emitted number carries its epistemic status. No estimate is ever dressed u
                          ▼
             ┌─────────────────────────────────────────────────┐
             │  this README: every formula verified against     │
-            │  authoritative source line-by-line (5 audits)    │
+            │  authoritative source line-by-line (6 audits)    │
             └─────────────────────────────────────────────────┘
 ```
 
@@ -258,21 +346,22 @@ Each layer tests the one beneath: fuzz tests formulas, live runs test the fuzz, 
 
 | # | Section | What you get |
 |---|---------|--------------|
-| 0 | [Why this is the correct metric](#0-why-this-is-the-correct-metric) | the theory behind prefix-cache |
-| 1 | [Pipeline at a glance](#1-pipeline-at-a-glance) | one diagram, six stages |
-| 2 | [The mathematical machinery](#2-the-mathematical-machinery) | every formula, with diagrams |
-| 3 | [Worked end-to-end numerical example](#3-worked-end-to-end-numerical-example) | a hand-computed two-turn trace |
-| 4 | [Complexity & cost](#4-complexity--cost) | time/space per stage |
-| 5 | [Formal invariants](#5-formal-invariants) | the properties the fuzz locks in |
-| 6 | [Confidence, diagnosis, cascade](#6-confidence-diagnosis-cascade) | the non-block math |
-| 7 | [Persistence & config](#7-persistence--config) | shard, salt, env vars |
-| 8 | [ Telemetry schema, privacy, tests](#8-telemetry-schema-privacy-tests) | event fields, guarantees, suite |
+| 0 | [Visual architecture at a glance](#0-visual-architecture-at-a-glance) | hero + ten diagrams; no formulas needed |
+| 1 | [Why this is the correct metric](#1-why-this-is-the-correct-metric) | the theory behind prefix-cache |
+| 2 | [Pipeline at a glance](#2-pipeline-at-a-glance) | one diagram, six stages |
+| 3 | [The mathematical machinery](#3-the-mathematical-machinery) | every formula, with diagrams |
+| 4 | [Worked end-to-end numerical example](#4-worked-end-to-end-numerical-example) | a hand-computed two-turn trace |
+| 5 | [Complexity & cost](#5-complexity--cost) | time/space per stage |
+| 6 | [Formal invariants](#6-formal-invariants) | the properties the fuzz locks in |
+| 7 | [Confidence, diagnosis, cascade](#7-confidence-diagnosis-cascade) | the non-block math |
+| 8 | [Persistence & config](#8-persistence--config) | shard, salt, env vars |
+| 9 | [ Telemetry schema, privacy, tests](#9-telemetry-schema-privacy-tests) | event fields, guarantees, suite |
 
 ---
 
-## 0. Why this is the correct metric
+## 1. Why this is the correct metric
 
-### 0.1 The prefix property of KV caching
+### 1.1 The prefix property of KV caching
 
 Every serious autoregressive inference engine (vLLM, SGLang radix cache, LMCache, Anthropic/OpenAI server-side caching) is built around one structural fact:
 
@@ -280,7 +369,7 @@ Every serious autoregressive inference engine (vLLM, SGLang radix cache, LMCache
 
 So the quantity that decides cost is not "how similar" two prompts are. It's a **single integer**: the length of their longest common token prefix (LCP).
 
-### 0.2 The LCP-implies-divergence theorem
+### 1.2 The LCP-implies-divergence theorem
 
 **Theorem.** Let `A`, `B` be token sequences and let `LCP(A,B)` be the length of their longest common prefix. Then the number of KV blocks a backend can reuse between them is exactly `⌊LCP(A,B) / Bpage⌋`, where `Bpage` is the page (block) size.
 
@@ -288,7 +377,7 @@ So the quantity that decides cost is not "how similar" two prompts are. It's a *
 
 > **Consequence.** A single changed byte early in the prompt — a timestamp, a random `request_id`, a reordered tool schema — destroys the *entire* cache downstream, even if 95% of the prompt is semantically identical. This is why "did the request get built stably?" is the whole game, and why a *structural* LCP measurement — not an embedding score — is the only honest observability metric.
 
-### 0.3 Why measure it at the framework layer
+### 1.3 Why measure it at the framework layer
 
 Backend counters tell you *what got cached*. They can't tell you *"the cache broke because your own upstream framework injected a random UUID at token 1024."*
 
@@ -301,11 +390,11 @@ Backend counters tell you *what got cached*. They can't tell you *"the cache bro
   WHY:   diagnosable + routable
 ```
 
-Hybriding the two isolates the failure domain: the gap between predicted and actual (`delta` = actual − predicted) splits "your framework built an unstable request" (low prediction, low actual) from "your backend evicted / routed away" (high prediction, low actual). §6.1 gives the full interpretation lattice.
+Hybriding the two isolates the failure domain: the gap between predicted and actual (`delta` = actual − predicted) splits "your framework built an unstable request" (low prediction, low actual) from "your backend evicted / routed away" (high prediction, low actual). §7.1 gives the full interpretation lattice.
 
 ---
 
-## 1. Pipeline at a glance
+## 2. Pipeline at a glance
 
 ```
         pi agent / subagent / turn builds final provider request
@@ -346,22 +435,22 @@ Everything is **observe-only**: no hook mutates the outgoing request, injects ca
 
 | Hook | Role in the extension |
 |---|---|
-| `before_provider_request` | **High-fidelity predict path** (pi ≥ 0.84). Receives the exact wire payload → fingerprints the real request body. Observe-only (§1 stage 1–6). |
+| `before_provider_request` | **High-fidelity predict path** (pi ≥ 0.84). Receives the exact wire payload → fingerprints the real request body. Observe-only (§2 stage 1–6). |
 | `after_provider_response` | **Observation capture** — provider status/headers only; deliberately *does not* clear the pending prediction (usage comes on `message_end`). Observe-only. |
 | `message_end` | **Reconcile & emit.** Carries the assistant `usage` block; on pi ≤ 0.55 also runs the session-history fallback prediction. Pairs prediction↔usage, emits the event, updates rollup. |
-| `agent_start` / `agent_end` | Push / pop a `{kind:"agent"}` frame on the cascade stack → drives `agentDepth` and `callType` (§6.3). |
+| `agent_start` / `agent_end` | Push / pop a `{kind:"agent"}` frame on the cascade stack → drives `agentDepth` and `callType` (§7.3). |
 | `turn_start` / `turn_end` | Push / pop a `{kind:"turn"}` frame; `turn_start` also stamps `turnId = turn_<session>#<turnIndex>`. |
 | `session_start` | Resolve the authoritative `sessionId` (`sessionManager.getSessionId()`, fallback branch-scan) and set `rootCallId`. |
 
-**Backend identification** (`getBackend`, the `BackendId` union): inferred from `(model.id, model.provider)` → `anthropic` | `openai` | `bedrock` | `vllm` | `sglang` | `custom_managed_inhouse` | `unknown_backend`. Drives provenance confidence (§6.1) and the `backend` field on every event.
+**Backend identification** (`getBackend`, the `BackendId` union): inferred from `(model.id, model.provider)` → `anthropic` | `openai` | `bedrock` | `vllm` | `sglang` | `custom_managed_inhouse` | `unknown_backend`. Drives provenance confidence (§7.1) and the `backend` field on every event.
 
 ---
 
-## 2. The mathematical machinery
+## 3. The mathematical machinery
 
 Each subsection shows the exact formula, a diagram, and the file/line grounding.
 
-### 2.1 Primitive hash `H` — dual FNV-1a 64-bit
+### 3.1 Primitive hash `H` — dual FNV-1a 64-bit
 
 **File:** `src/config.ts` · `hashString`. The universal reduce-of-everything:
 
@@ -398,7 +487,7 @@ lane h₂:  h₂⊕1──▶×P──▶h₂⊕2──▶×P──▶  …   h�
 2. **Two lanes** with distinct seeds, XOR-combined, widen effective output and kill the structured-collision patterns single-lane 64-bit FNV shows on *highly repetitive text* (prompts are full of that: whitespace runs, repeated delimiters).
 3. **Folding `i+1` into lane 2** makes H *sequence-sensitive*, not multiset-sensitive. `H("ab") ≠ H("ba")` is *required* — block matching is about **ordered** prefixes. Position-independence would be a correctness bug, so it's baked into the primitive.
 4. **Fixed 16-hex contract** — every hash in the system is one uniform opaque string. LCP is then pure string equality; the shard; the telemetry — all compare uniform IDs, with no variable-width edge cases.
-5. **Not cryptographic, and deliberately so.** Tenant isolation is enforced by the *inputs* (`cacheNamespace`, `cacheSalt`, §2.9), not by hash strength. FNV-1a×2 over namespace-bound inputs covers *accidental* collision; that's all a telemetry hash needs.
+5. **Not cryptographic, and deliberately so.** Tenant isolation is enforced by the *inputs* (`cacheNamespace`, `cacheSalt`, §3.9), not by hash strength. FNV-1a×2 over namespace-bound inputs covers *accidental* collision; that's all a telemetry hash needs.
 
 #### `hashExtraCacheKeys` — order-independence
 
@@ -410,7 +499,7 @@ The **`sort(keys)`** is what makes the fingerprint immune to JSON insertion-orde
 
 ---
 
-### 2.2 Tokeniser `T` — 4-chars/token FNV pseudo-ids
+### 3.2 Tokeniser `T` — 4-chars/token FNV pseudo-ids
 
 **File:** `src/tokenize.ts` · `Tokenizer.encode`. A deterministic pseudo-tokeniser stands in for the model's real BPE:
 
@@ -446,11 +535,11 @@ chars:  [a b c d][e f g h][i j k l][m n … ]
 
 Both are *exact*, so:
 
-> **The LCP of pseudo-token block chains equals the LCP of real-BPE block chains whenever the underlying byte-prefix is identical.** The prefix-match *ratio* (§2.7) is structurally exact; only the *absolute token count* is approximate (~4 chars/token ≈ within ~15% of real BPE yield for code+prose). The extension flags the approximate counts `confidence:"low"` (§6.1) rather than pretend they're exact — that's the honest estimate-vs-exact split the design mandates.
+> **The LCP of pseudo-token block chains equals the LCP of real-BPE block chains whenever the underlying byte-prefix is identical.** The prefix-match *ratio* (§3.7) is structurally exact; only the *absolute token count* is approximate (~4 chars/token ≈ within ~15% of real BPE yield for code+prose). The extension flags the approximate counts `confidence:"low"` (§7.1) rather than pretend they're exact — that's the honest estimate-vs-exact split the design mandates.
 
 ---
 
-### 2.3 Block splitting
+### 3.3 Block splitting
 
 **File:** `src/tokenize.ts` · `splitIntoBlocks`.
 
@@ -469,11 +558,11 @@ tokens:  [t₀…t₁₅][t₁₆…t₃₁][t₃₂…t₄₇] …… [t_{nB} �
                                             └─ backends only cache FULL pages
 ```
 
-**Why the tail is excluded (and never matches):** backends cache *full* pages. A 7-token tail cannot reuse a 16-token page. This is *exactly* why, on a *perfect repeat*, `block_match_pct` can reach `1.0` while `token_match_pct` stops at ≈0.95 (§2.7) — that's not a defect, it's the truthful signature of page-aligned caching.
+**Why the tail is excluded (and never matches):** backends cache *full* pages. A 7-token tail cannot reuse a 16-token page. This is *exactly* why, on a *perfect repeat*, `block_match_pct` can reach `1.0` while `token_match_pct` stops at ≈0.95 (§3.7) — that's not a defect, it's the truthful signature of page-aligned caching.
 
 ---
 
-### 2.4 The block fingerprint chain — `hashBlock`
+### 3.4 The block fingerprint chain — `hashBlock`
 
 **File:** `src/fingerprint.ts` · `hashBlock`. This is the identity of the whole design — a vLLM-isomorphic Merkle-style chain:
 
@@ -505,13 +594,13 @@ H(context, G₀, tokens[0..15])  = h₀ ──┐
 
 > `hᵢ` is a function of `(context, tokens[0..16(i+1)−1])` — the *entire* prefix, not just block *i*.
 
-So the prefix-comparison of §2.6 collapses to O(matched-length) **string equality** `prevChain[i] === curChain[i]`: two chains agree at index *i* iff their whole prefixes up to *i* are contextually identical — same namespace, model, template, *and* byte-content, *at the same position*. One string compare stands in for a token-by-token deep diff. This is precisely vLLM's `(parent_hash, block_tokens, extra_keys)` block identity — the extension is model-isomorphic with the very system it measures.
+So the prefix-comparison of §3.6 collapses to O(matched-length) **string equality** `prevChain[i] === curChain[i]`: two chains agree at index *i* iff their whole prefixes up to *i* are contextually identical — same namespace, model, template, *and* byte-content, *at the same position*. One string compare stands in for a token-by-token deep diff. This is precisely vLLM's `(parent_hash, block_tokens, extra_keys)` block identity — the extension is model-isomorphic with the very system it measures.
 
-The version inputs (`fingerprintVersion`, `templateVersion`, `tokenizerVersion`) mean any template/tokeniser change reshuffles *every* hash — the extension can never claim a match across incompatible renderings. **Only the 16-hex hashes are retained; token ids and prompt text are consumed and dropped** (privacy §8.2).
+The version inputs (`fingerprintVersion`, `templateVersion`, `tokenizerVersion`) mean any template/tokeniser change reshuffles *every* hash — the extension can never claim a match across incompatible renderings. **Only the 16-hex hashes are retained; token ids and prompt text are consumed and dropped** (privacy §9.2).
 
 ---
 
-### 2.5 The dual-track prompt reconstruction
+### 3.5 The dual-track prompt reconstruction
 
 **File:** `src/index.ts` · `promptFromPayload` / `promptFromSessionHistory` + `src/prompt.ts` · `normalizeVolatileContent`.
 
@@ -546,11 +635,11 @@ is the recoverable loss attributable to unstable metadata. (R5 fix: `canonical_m
 <|im_start|>tools ${ sort( name+"#"+H(schema) ).join("|") }<|im_end|>
 ```
 
-— a *hash* of the sorted tool name+schema list. A tool-list change shifts the fingerprint and surfaces an honest mismatch; emitting a hash (not names/schemas) keeps the telemetry content-clean (§8.2). Fuzz scenario Y locks this.
+— a *hash* of the sorted tool name+schema list. A tool-list change shifts the fingerprint and surfaces an honest mismatch; emitting a hash (not names/schemas) keeps the telemetry content-clean (§9.2). Fuzz scenario Y locks this.
 
 ---
 
-### 2.6 Longest-common-prefix matching
+### 3.6 Longest-common-prefix matching
 
 **File:** `src/index.ts` · `beforeCompletion`. Against the stored previous chain:
 
@@ -558,13 +647,13 @@ is the recoverable loss attributable to unstable metadata. (R5 fix: `canonical_m
 matched = 0
 for i in 0 .. min(|prev|, |cur|) − 1:
     if prev[i] === cur[i] then matched++
-    else BREAK                          ← terminal, by §0.2 / §2.4
+    else BREAK                          ← terminal, by §1.2 / §3.4
 
 matchedBlocks          = matched
 predictedMatchedTokens = matched × B
 ```
 
-**Why `BREAK` is correct, not an optimisation.** Because `hᵢ` commits to the whole prefix (§2.4), the first index where the chains disagree invalidates *every* later block. There is no "match again later" — reuse is prefix-contiguous (§0.2). Cost: O(matched length), O(1)` best.
+**Why `BREAK` is correct, not an optimisation.** Because `hᵢ` commits to the whole prefix (§3.4), the first index where the chains disagree invalidates *every* later block. There is no "match again later" — reuse is prefix-contiguous (§1.2). Cost: O(matched length), O(1)` best.
 
 **Diagram:**
 
@@ -590,7 +679,7 @@ Claiming `"canonical"` on a tie would misattribute a clean repeat to the normali
 
 ---
 
-### 2.7 The two percentages (and why both exist)
+### 3.7 The two percentages (and why both exist)
 
 Every event carries **three** ratios, each defined for a distinct purpose:
 
@@ -618,7 +707,7 @@ blockMatchPct  =  matched   /  n_full
 
 ---
 
-### 2.8 Cache-clobbering detection
+### 3.8 Cache-clobbering detection
 
 **File:** `src/index.ts` · `bestMatchByRoot`. A per-root running maximum detects *regressions*, distinct from cold starts:
 
@@ -640,7 +729,7 @@ matched     48    496    512        0   ← clobbering DETECTED
 
 ---
 
-### 2.9 Cache-key identity
+### 3.9 Cache-key identity
 
 **File:** `src/config.ts` (salt/version resolvers) + `src/index.ts`. The identity chain is built so two prompts fingerprint identically **iff** they share a genuine cacheable lineage:
 
@@ -671,13 +760,13 @@ saltPart ───────────────────────�
 **Why this construction is right:**
 
 - **`model` and `sessionId` are *inside* the key** — switching models *must* zero the match (KV tensors are model-specific); fuzz scenario C proves `predicted_match_pct = 0` after a model swap.
-- **Deterministic default salt** (`salt-H(org:app)`) means `pi --continue` in a *fresh process* rebuilds the same `cacheKeyRoot` for the same session — that's what makes cross-process lineage (§7.1) possible at all. An explicit salt overrides it and is folded into the namespace *only when set*, so opting into stricter isolation doesn't silently break the determinism the default relies on.
+- **Deterministic default salt** (`salt-H(org:app)`) means `pi --continue` in a *fresh process* rebuilds the same `cacheKeyRoot` for the same session — that's what makes cross-process lineage (§8.1) possible at all. An explicit salt overrides it and is folded into the namespace *only when set*, so opting into stricter isolation doesn't silently break the determinism the default relies on.
 - **`cacheNamespace` is the tenant-isolation boundary** — two orgs, same session id, same model, same salt ⇒ different namespace ⇒ different chain. Isolation is enforced *at the hash input*, not by hoping the weak hash is lucky.
 - **`fingerprintVersion` is a static schema label** *separate* from tenant identity: tenant isolation travels through `namespace + salt`, version skew through `fingerprintVersion`. (R8 audit fix: it's now *emitted* on every event, not just used internally.)
 
 ---
 
-### 2.10 Roll-up statistics
+### 3.10 Roll-up statistics
 
 **File:** `src/index.ts` · `recordRollup`. Per bucket (`byModel` / `byCallType` / `byBreakReason`):
 
@@ -716,7 +805,7 @@ ring:   [ x_{n-511} , … , x_{n-2} , x_{n-1} , x_n ]     cap 512
 
 ---
 
-## 3. Worked end-to-end numerical example
+## 4. Worked end-to-end numerical example
 
 A two-turn trace, computed by hand with the real formulas. (Verified: the hash/token values below are the actual outputs of the live `hashString` and `Tokenizer`.)
 
@@ -742,7 +831,7 @@ cur:   [h₀]………[h₃₀][h₃₁][h₃₂][h₃₃][h₃₄][h₃₅]
 matchedBlocks = 31
 ```
 
-- **Percentages (the §2.7 identity, on real numbers):**
+- **Percentages (the §3.7 identity, on real numbers):**
 
 ```
 matchedTokens   = 31 × 16            = 496
@@ -759,7 +848,7 @@ actual hit%  = cacheRead / (input + cacheRead) = 496/(496+81) = 0.8596
 delta        = cacheRead − matchedTokens       = 496 − 496 = 0   ← prediction == actual
 ```
 
-A `delta` of `0` here is the extension *exactly* predicting the provider's real cached-token count — the whole point of the hybrid design (§6.1's "high/high = healthy" cell).
+A `delta` of `0` here is the extension *exactly* predicting the provider's real cached-token count — the whole point of the hybrid design (§7.1's "high/high = healthy" cell).
 
 **H primitive spot-check** (lane math on the two-char input `"AB"`, hand-verified against `hashString`):
 
@@ -771,7 +860,7 @@ H("AB") = h₁ ⊕ h₂         → 3f179cccb164c1ed      ✓ matches live hashS
 
 ---
 
-## 4. Complexity & cost
+## 5. Complexity & cost
 
 Per completion call, where `L` = prompt length (chars), `T = L/4` tokens, `B = 16`, `m` = matched prefix blocks:
 
@@ -801,7 +890,7 @@ The dominant cost is the cold-path O(L) pass, which is unavoidable *for any* hon
 
 ---
 
-## 5. Formal invariants
+## 6. Formal invariants
 
 The properties the fuzz suite holds as load-bearing (each locked by named scenarios):
 
@@ -820,13 +909,13 @@ The properties the fuzz suite holds as load-bearing (each locked by named scenar
 | I11 | Clobbering | `matched=0 ∧ priorBest ≥ 64 ⇒ cacheClobberingDetected` |
 | I12 | Hybrid source | `cacheRead` defined (number, incl. 0) ⟺ `cache_match_source="hybrid"`; `delta` defined only when `predicted > 0` |
 
-These are not aspirations; scenarios A–Z (§8.3) *assert* each one against the real emitted JSONL.
+These are not aspirations; scenarios A–Z (§9.3) *assert* each one against the real emitted JSONL.
 
 ---
 
-## 6. Confidence, diagnosis, cascade
+## 7. Confidence, diagnosis, cascade
 
-### 6.1 Confidence model (design-doc §22, an *absolute* map)
+### 7.1 Confidence model (design-doc §22, an *absolute* map)
 
 | Tokenisation source | Confidence |
 |---|---|
@@ -846,7 +935,7 @@ Provenance modifiers recorded as `confidence_reasons` (and grade effects): `reco
 | Low | Low | Bad request construction — fix the framework upstream |
 | Low | High | Estimator conservative, or backend smarter than predicted |
 
-### 6.2 Cache-break diagnosis
+### 7.2 Cache-break diagnosis
 
 When lineage exists and `matched < n_full`:
 
@@ -888,13 +977,13 @@ Fallback override (only when no reason was set above):
 matched==0 ∧ prev[0] ≠ cur[0] ∧ suspected_break_reason == null
                                          → "session_restart"
   (diagnosis: "first block differs from previous cache entry")
-clobbering (§2.8)                          → cache_clobbering_detected = true +
+clobbering (§3.8)                          → cache_clobbering_detected = true +
   cache_clobbering_expected_tokens, independent of the reason above
 ```
 
-`CacheBreakReason` ∈ `{system_prompt_change, tool_list_change, history_rewrite, template_change, tokenizer_change, volatility, model_change, session_restart}` (`tool_list_change` via the round-10 tools-header hash, §2.5).
+`CacheBreakReason` ∈ `{system_prompt_change, tool_list_change, history_rewrite, template_change, tokenizer_change, volatility, model_change, session_restart}` (`tool_list_change` via the round-10 tools-header hash, §3.5).
 
-### 6.3 Call-cascade attribution
+### 7.3 Call-cascade attribution
 
 `agent_start`/`turn_start` push `{kind}` frames; `*_end` pops the most recent of its kind:
 
@@ -908,9 +997,9 @@ Scenario Q locks the matrix: depth 0→`agent_turn`, depth 1→`root_user_turn`,
 
 ---
 
-## 7. Persistence & config
+## 8. Persistence & config
 
-### 7.1 Cross-process shard
+### 8.1 Cross-process shard
 
 Pi launches a fresh process per turn, so lineage persists to `{telemetryDir}/_fingerprint-index.jsonl` — one line `{k, h:[hashes], t}` per write, latest-per-key wins.
 
@@ -925,7 +1014,7 @@ turn k ──► write shard({root:G₀..},  {#canonical},  {#call: (k+1).toStri
 turn k+1 (new pid) ◄── read shard ◄── seed callIndex ─┘   →  call_index continues
 ```
 
-### 7.2 Configuration (env vars)
+### 8.2 Configuration (env vars)
 
 | Variable | Default | Controls |
 |---|---|---|
@@ -937,16 +1026,16 @@ turn k+1 (new pid) ◄── read shard ◄── seed callIndex ─┘   →  c
 | `PI_CACHE_MATCH_ORG_ID` / `PI_ORG_ID` / `XYNE_ORG_ID` | `org_x` | tenant id + namespace input |
 | `PI_CACHE_MATCH_APP_ID` / `PI_APP_ID` / `XYNE_APP_ID` | `xyne` | app id |
 | `PI_CACHE_MATCH_AGENT_ID` / `PI_AGENT_ID` / `XYNE_AGENT_ID` | `xyne-cli` | agent id |
-| `PI_CACHE_MATCH_SALT` / `PI_SOFT_SALT` | `salt-H(org:app)[0..11]` | namespace isolation salt (§2.9) |
+| `PI_CACHE_MATCH_SALT` / `PI_SOFT_SALT` | `salt-H(org:app)[0..11]` | namespace isolation salt (§3.9) |
 | `PI_CACHE_MATCH_DEBUG` / `PI_CACHE_MATCH_DEBUG_MODE` | unset | `1` → content-free structural stderr log |
 
 Resolution: explicit `PI_CACHE_MATCH_*` → shared `PI_*`/`XYNE_*` → `~/.pi/agent/settings.json` (`defaults.*`/`telemetry.*`) → defaults. Compile-time (not env): `approximateCharTokens=4`, `maxSessionIndexEntries=1000`, ring bound `512`.
 
 ---
 
-## 8. Telemetry schema, privacy, tests
+## 9. Telemetry schema, privacy, tests
 
-### 8.1 Event schema — `pi.cache_match.completion`, one JSONL line per call
+### 9.1 Event schema — `pi.cache_match.completion`, one JSONL line per call
 
 | Group | Fields |
 |---|---|
@@ -987,13 +1076,13 @@ usage_input?, usage_output?, usage_cache_read?, usage_cache_write?,
   ("hybrid"|"pi_prediction")
 ```
 
-Sub-agent events additionally carry `subagent_id?`/`parent_call_id?` (Identity group, §cascade). Timing fields `ttft_ms?`, `prefill_ms?`, `decode_ms?`, `total_latency_ms?` are defined in the schema but **only ever present when the provider exposes them** — current pi builds don't, so they are absent in practice (§8.4).
+Sub-agent events additionally carry `subagent_id?`/`parent_call_id?` (Identity group, §cascade). Timing fields `ttft_ms?`, `prefill_ms?`, `decode_ms?`, `total_latency_ms?` are defined in the schema but **only ever present when the provider exposes them** — current pi builds don't, so they are absent in practice (§9.4).
 
-### 8.2 Privacy contract
+### 9.2 Privacy contract
 
 Only hashes, counts, ratios, block indices, region labels, and `safeString`-clamped (≤256-char) id strings are ever computed, stored, or emitted. `tokenIds` and the prompt `text` are transient and dropped. Fuzz G and N seed real secrets (`user's private medical history: test-value-99`, `Secret system directive X-42`, `hunter2`) into content and assert none appear in any emitted line. `PI_CACHE_MATCH_DEBUG=1` logs only content-free structural markers to stderr (never prompt bytes), off by default.
 
-### 8.3 Tests
+### 9.3 Tests
 
 **259/259 assertions pass across 26 scenarios (A–Z), including a 3000-call stress run.** (Live-verified for this README.) Run with `node tests/run.ts`. Coverage: A repeat · B volatility · C model change · D history append · E history rewrite · F subagent cascade · G/N privacy + safeString · H no-usage honesty · I headers-don't-fabricate · J/K randomised + concurrent · L empty-input safety · M slash commands · O field presence · P clobbering · Q cascade matrix · R 3000-call stress · S dual pi-version paths · T metric-identity invariants · U canonical denominator · V rollup vs brute force · W confidence map · X schema audit + no-fabrication · Y tool-list change · **Z call-index continuity across fresh processes**.
 
@@ -1002,7 +1091,7 @@ Only hashes, counts, ratios, block indices, region labels, and `safeString`-clam
 ```
 turn1 (pid A): pred=0.000 tok=0.000 blk=0.000 affinity=0.000 from=none   conf=low cacheRead=128
 turn2 (pid B): pred=0.777 tok=0.777 blk=0.795 affinity=0.795 from=actual conf=low cacheRead=1536
-               └─ blk > tok by exactly the partial-tail dilution (§2.7) ✓
+               └─ blk > tok by exactly the partial-tail dilution (§3.7) ✓
 content leaked: none
 ```
 
@@ -1034,7 +1123,7 @@ The numbers prove the design end-to-end on live wire data: `call_index` sequenti
 
 Rounds 13–15 verify end-to-end what the fuzz only simulates: the extension runs against two *real* harnesses, two *real* providers, and a *real* compacting agent runtime, and never emits a wrong number or a leak. The only pi-mono paths *not* exercised on either stack are (i) `--fork` ID lineage under xyne (xyne has no `--fork`), (ii) threshold compaction under xyne (no pre-trust sandbox equivalent), and (iii) a >2-turn single-lane in xyne (xyne's `--session` spawns a fresh session id per turn). All three remain pi-mono-only scenarios, all were verified live in rounds 13b–14 there.
 
-### 8.4 Metric realism — exact vs approximate, honestly labelled
+### 9.4 Metric realism — exact vs approximate, honestly labelled
 
 | Field(s) | Realism | Grounding |
 |---|---|---|
