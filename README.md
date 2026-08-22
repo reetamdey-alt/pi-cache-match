@@ -96,13 +96,10 @@ It does this **before** the request leaves the process, purely from the framewor
 
 Implementation authority: `/tmp/pi-cache-match-work/src` (mirrored to the live install `~/.pi/agent/extensions/pi-cache-match/src`). This README documents **the authority**, formula for formula. At the time of writing the two were `diff -rq` clean after every completed round except the **round-14** structural change (see note below), for which the install lags by one revision.
 
-> **Round-14 caveat (informational):** the workspace `src/index.ts` (1163 lines) carries the `isAppend = matchedBlocks >= previous.blockHashes.length - 1` straddle fix *plus* the `recon.systemPromptLen > 0` structural system-prompt catch. The live install (1125 lines) has the straddle fix only. The README documents the workspace (source of truth). A `rsync -a --delete` from the workspace to the install brings them into lockstep.
-
 ---
 
 ## 0. Visual architecture at a glance
 
-Nine diagrams. Read top-to-bottom; together they tell the entire story before a single formula.
 
 ### 0.A  Where this extension sits — the big picture
 
