@@ -15,6 +15,7 @@ import {
 	hashString,
 	type CacheMatchConfig,
 } from "./config.ts";
+import { CacheMatchDashboard } from "./dashboard.ts";
 import { emptyParentHash, hashBlock } from "./fingerprint.ts";
 import {
 	buildSegmentInfo,
@@ -127,6 +128,9 @@ interface SessionState {
 	/** Doc §12.4: remember the strongest prior prefix match we saw under each root,
 	 * so a sudden drop to zero can be flagged as cache clobbering. */
 	bestMatchByRoot: Map<string, number>;
+	/** Ring of the last N emitted events — source for /cachematch dashboard.
+	 * Bounded so the extension never holds unbounded memory in long sessions. */
+	events: CacheMatchEvent[];
 }
 
 export default function (pi: ExtensionAPI) {
@@ -167,6 +171,7 @@ export default function (pi: ExtensionAPI) {
 				stats: { byModel: {}, byCallType: {}, byBreakReason: {} },
 				latestFingerprints: new Map(),
 				bestMatchByRoot: new Map(),
+				events: [],
 			};
 		}
 		return state;
@@ -886,6 +891,7 @@ export default function (pi: ExtensionAPI) {
 			usage_output: observation?.usageOutput,
 			usage_cache_read: observation?.usageCacheRead,
 			usage_cache_write: observation?.usageCacheWrite,
+			usage_total: st.lastUsage?.totalTokens,
 			prediction_actual_delta: observation?.predictionActualDelta,
 			backend_metrics_available: observation?.backendObserved ?? false,
 			cache_match_source: cacheMatchSource,
@@ -893,6 +899,8 @@ export default function (pi: ExtensionAPI) {
 
 		appendEvent(event, cfg.orgId, cfg.appId, cfg.agentId);
 		st.lastEvent = event;
+		st.events.push(event);
+		if (st.events.length > 200) st.events.shift();
 		return event;
 	}
 
@@ -929,10 +937,17 @@ export default function (pi: ExtensionAPI) {
 			entry.totalPromptTokens += prediction.totalPromptTokens;
 			entry.totalMatchedTokens += prediction.predictedMatchedTokens;
 			entry.totalMissTokens += Math.max(prediction.totalPromptTokens - prediction.predictedMatchedTokens, 0);
+			// NaN-guard: if prediction somehow yielded NaN upstream (tokenize
+			// divide-by-zero, empty prompt, etc.), refuse to fold it into the
+			// running average — one bad call must not poison all later ones.
+			const safePct =
+				typeof prediction.predictedMatchPct === "number" && Number.isFinite(prediction.predictedMatchPct)
+					? Math.max(0, Math.min(1, prediction.predictedMatchPct))
+					: 0;
 			entry.avgPredictedMatchPct =
-				(entry.avgPredictedMatchPct * (entry.totalCalls - 1) + prediction.predictedMatchPct) / entry.totalCalls;
+				(entry.avgPredictedMatchPct * (entry.totalCalls - 1) + safePct) / entry.totalCalls;
 			// Doc §24: keep a bounded sample ring so p50/p95 can be computed.
-			entry.matchPctSamples.push(prediction.predictedMatchPct);
+			entry.matchPctSamples.push(safePct);
 			if (entry.matchPctSamples.length > 512) entry.matchPctSamples.shift();
 			if (entry.matchPctSamples.length >= 1) {
 				const sorted = [...entry.matchPctSamples].sort((a, b) => a - b);
@@ -1102,62 +1117,114 @@ export default function (pi: ExtensionAPI) {
 
 	// ─── commands ─────────────────────────────────────────────────────────────
 
-	pi.registerCommand("cache-match", {
-		description: "Show predicted cache match %, affinities, and cache-break diagnostics for the current session",
+	// /cachematch — canonical dashboard command (full-screen overlay).
+	pi.registerCommand("cachematch", {
+		description: "Open the cache-match dashboard (full-screen visual overlay)",
 		handler: async (_args, ctx) => {
-			const last = lastPrediction();
-			if (!last) {
-				ctx.ui.notify("No cache-match data yet for this session.", "info");
-				return;
+			const st = ensureState(ctx);
+			const result = await ctx.ui.custom<{ action: "open" } | undefined>(
+				(tui, theme, _keybindings, done) => {
+					// Read the real viewport so the dashboard can fold sections to fit.
+					// Reserve 2 rows (pi-tui chrome) and 2 more (margin) so the box never
+					// exceeds the visible surface. Defensive: fall back to 40 when the
+					// terminal doesn't report a sensible size (e.g. wrapped in script(1))
+					// or when invoked from a fuzz harness with a null tui.
+					const tuiLike = tui as unknown as { terminal?: { rows?: number } } | null | undefined;
+					const termRows = tuiLike?.terminal?.rows;
+					const cap = typeof termRows === "number" && termRows > 0 ? Math.max(24, termRows - 4) : 40;
+					return new CacheMatchDashboard({
+						events: st.events,
+						stats: st.stats,
+						telemetryFile:
+							config ? join(config.telemetryDir, `${config.orgId}-${config.appId}-${config.agentId}.jsonl`) : "",
+						agentId: config?.agentId ?? "pi-agent",
+						sessionId: st.sessionId,
+						theme,
+						done,
+						maxLines: cap,
+					});
+				},
+				{
+					overlay: true,
+					// Keep the box inside the real terminal viewport — pi-tui will
+					// truncate overflow *after* our own layout, but anchoring now
+					// means the bottom (turn log + footer) is never lost to an
+					// off-screen crop.
+					overlayOptions: () => ({
+						// "100%" of terminal height (minus pi-tui's 2-row margin) is the
+						// right cap: the dashboard's own maxLines logic already folds the
+						// layout to fit, this just prevents off-screen crop on tiny terms.
+						maxHeight: "95%",
+					}),
+				},
+			);
+			if (result?.action === "open" && config) {
+				const path = join(config.telemetryDir, `${config.orgId}-${config.appId}-${config.agentId}.jsonl`);
+				const { spawn } = await import("node:child_process");
+				const pager = process.env.PAGER || "less";
+				spawn(pager, [path], { stdio: "inherit", shell: false }).unref();
+				ctx.ui.notify(`Opened ${path} in ${pager}`, "info");
 			}
-			const lines: string[] = [
-				`### Cache Match — ${last.agentId} — ${last.callId}`,
-				``,
-				`**Predicted match:** ${(last.predictedMatchPct * 100).toFixed(1)}% (${last.predictedMatchedTokens} / ${last.totalPromptTokens} tokens)`,
-				`**Blocks:** ${last.predictedMatchedBlocks} of ${last.totalFullBlocks} (block size ${last.blockSizeTokens})`,
-				`**Affinity score:** ${last.predictedMatchPct.toFixed(3)}`,
-				`**Session:** ${last.sessionId}`,
-				`**Model:** ${last.model} · **Backend:** ${last.backend || "unknown"}`,
-				`**Confidence:** ${last.confidence}${last.confidenceReasons.length > 0 ? ` (${last.confidenceReasons.join("; ")})` : ""}`,
-			];
-			if (last.firstMismatchBlockIndex !== undefined) {
-				lines.push(
-					`**Cache-break:** block ${last.firstMismatchBlockIndex}${last.firstMismatchRegion ? ` (${last.firstMismatchRegion})` : ""} — ${last.suspectedBreakReason || "unstable metadata"}`,
-				);
-			}
-			if (last.canonicalMatchedPct !== undefined && last.canonicalMatchedPct > last.predictedMatchPct) {
-				lines.push(`**Canonical match:** ${(last.canonicalMatchedPct * 100).toFixed(1)}% (volatility-normalised)`);
-			}
-			ctx.ui.notify(lines.join("\n"), "info");
+		},
+	});
+
+	// Legacy aliases — both redirect to the identical dashboard.
+	// Both pass the same overlayOptions as /cachematch: the alias was opening
+	// a bare `{overlay: true}` and losing the 95% maxHeight cap, so on tight
+	// terminals the bottom fold (TURN LOG + footer) could crop.
+	pi.registerCommand("cache-match", {
+		description: "(alias for /cachematch) Open the cache-match dashboard",
+		handler: async (_args, ctx) => {
+			const st = ensureState(ctx);
+			await ctx.ui.custom<undefined>(
+				(tui, theme, _keybindings, done) => {
+					const tuiLike = tui as unknown as { terminal?: { rows?: number } } | null | undefined;
+					const termRows = tuiLike?.terminal?.rows;
+					const cap = typeof termRows === "number" && termRows > 0 ? Math.max(24, termRows - 4) : 40;
+					return new CacheMatchDashboard({
+						events: st.events,
+						stats: st.stats,
+						telemetryFile: config ? join(config.telemetryDir, `${config.orgId}-${config.appId}-${config.agentId}.jsonl`) : "",
+						agentId: config?.agentId ?? "pi-agent",
+						sessionId: st.sessionId,
+						theme,
+						done: () => done(undefined),
+						maxLines: cap,
+					});
+				},
+				{
+					overlay: true,
+					overlayOptions: () => ({ maxHeight: "95%" }),
+				},
+			);
 		},
 	});
 
 	pi.registerCommand("cache-match-agent", {
-		description: "Show per-agent / per-model cache efficiency rollups for the current session",
+		description: "(alias for /cachematch) Open the cache-match dashboard",
 		handler: async (_args, ctx) => {
 			const st = ensureState(ctx);
-			if (!st.lastEvent) {
-				ctx.ui.notify("No cache-match data yet for this session.", "info");
-				return;
-			}
-			const lines: string[] = [`### Agent Cache Efficiency — ${st.sessionId}`, ``];
-			for (const [model, stats] of Object.entries(st.stats.byModel)) {
-				if (stats.totalCalls === 0) continue;
-				lines.push(
-					`**Model ${model}**: avg ${(stats.avgPredictedMatchPct * 100).toFixed(1)}%, affinity ${stats.avgAffinityScore.toFixed(3)}, ${stats.totalCalls} calls, prompt tokens ${stats.totalPromptTokens}`,
-				);
-			}
-			for (const [callType, stats] of Object.entries(st.stats.byCallType)) {
-				if (stats.totalCalls === 0) continue;
-				lines.push(`**Call type ${callType}**: avg ${(stats.avgPredictedMatchPct * 100).toFixed(1)}%, ${stats.totalCalls} calls`);
-			}
-			if (Object.keys(st.stats.byBreakReason).length > 0) {
-				lines.push("", `**Break reasons:**`);
-				for (const [reason, stats] of Object.entries(st.stats.byBreakReason)) {
-					lines.push(`  - ${reason}: ${stats.totalCalls} calls`);
-				}
-			}
-			ctx.ui.notify(lines.join("\n"), "info");
+			await ctx.ui.custom<undefined>(
+				(tui, theme, _keybindings, done) => {
+					const tuiLike = tui as unknown as { terminal?: { rows?: number } } | null | undefined;
+					const termRows = tuiLike?.terminal?.rows;
+					const cap = typeof termRows === "number" && termRows > 0 ? Math.max(24, termRows - 4) : 40;
+					return new CacheMatchDashboard({
+						events: st.events,
+						stats: st.stats,
+						telemetryFile: config ? join(config.telemetryDir, `${config.orgId}-${config.appId}-${config.agentId}.jsonl`) : "",
+						agentId: config?.agentId ?? "pi-agent",
+						sessionId: st.sessionId,
+						theme,
+						done: () => done(undefined),
+						maxLines: cap,
+					});
+				},
+				{
+					overlay: true,
+					overlayOptions: () => ({ maxHeight: "95%" }),
+				},
+			);
 		},
 	});
 }

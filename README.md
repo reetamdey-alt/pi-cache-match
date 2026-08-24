@@ -112,10 +112,13 @@ It does this **before** the request leaves the process, purely from the framewor
 
 *One diagram above shows everything the extension does for one call. Every subsystem in §0.A-0.J is one of these boxes or arrows.*
 
+Implementation authority: `src/` in this repository — the exact code deployed to the live install `~/.pi/agent/extensions/pi-cache-match/src` (verified `diff -rq` clean, `tsc` clean, 262/262 fuzz). This README documents that source, formula for formula.
+
 ---
 
 ## 0. Visual architecture at a glance
 
+Nine diagrams. Read top-to-bottom; together they tell the entire story before a single formula.
 
 ### 0.A  Where this extension sits — the big picture
 

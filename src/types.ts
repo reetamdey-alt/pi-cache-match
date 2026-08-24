@@ -213,10 +213,18 @@ export interface CacheMatchEvent {
 	usage_output?: number;
 	usage_cache_read?: number;
 	usage_cache_write?: number;
+	/** Provider-reported wire total — distinct from `total_prompt_tokens`, which
+	 * is pi's char-hash estimate. Compare against Σusage_* to sanity-check the
+	 * tokenizer. Only surfaces when pi exposes `usage.total_tokens`. */
+	usage_total?: number;
 	prediction_actual_delta?: number;
 	backend_metrics_available: boolean;
 	/** Doc §14.1: "hybrid" when backend usage reconciled with prediction, else "pi_prediction". */
 	cache_match_source?: "hybrid" | "pi_prediction";
+/* Cost fields intentionally NOT serialized: pi's usage.cost is synthetic for
+ * several backends (rate-estimation, not a billing record) and rendering a
+ * speculative dollar figure misleads. Token-level metrics (usage_cache_read /
+ * usage_cache_write / WR ratio) carry the honest economics. */
 }
 
 export interface SegmentInfo {
