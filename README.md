@@ -116,6 +116,62 @@ Implementation authority: `src/` in this repository — the exact code deployed 
 
 ---
 
+## Installation & usage
+
+### Install
+
+Drop the extension source into your pi agent extensions directory — pi auto-discovers it on startup:
+
+```bash
+mkdir -p ~/.pi/agent/extensions/pi-cache-match
+git clone https://github.com/reetamdey-alt/pi-cache-match /tmp/pi-cache-match
+cp -r /tmp/pi-cache-match/src ~/.pi/agent/extensions/pi-cache-match/
+```
+
+That's it. No build step, no npm install — the runtime loads the TypeScript source directly. If you already have it and want to update:
+
+```bash
+cd /tmp/pi-cache-match && git pull
+cp -r src ~/.pi/agent/extensions/pi-cache-match/
+```
+
+### Run
+
+Just use pi as normal — the extension hooks every completion call automatically and writes one JSONL event per call to `~/.pi/agent/cache-match/` (override with `PI_CACHE_MATCH_TELEMETRY_DIR`):
+
+```bash
+pi                                    # telemetry flows to ~/.pi/agent/cache-match/*.jsonl
+PI_CACHE_MATCH_TELEMETRY_DIR=/tmp/t pi   # custom output dir
+```
+
+### View the dashboard
+
+Inside a pi session (TUI), type any of:
+
+```
+/cachematch          # full-screen live cache dashboard
+/cache-match         # alias
+/cache-match-agent   # alias
+```
+
+The dashboard shows the live **HIT** rate for the current call chain, the running average (`AVG n`), actual provider cache-read tokens, estimated prefill savings, per-turn history, and cache-break diagnoses (`Esc` to close).
+
+### What you get
+
+- **One event per LLM call** in `org_<org>-<app>-<agent>.jsonl` (schema in §9.1) — predicted hit %, token accounting, break reason, routing hint, reconciled against the provider's real `usage.cacheRead`.
+- **`_fingerprint-index.jsonl`** — the cross-process shard that lets a brand-new pid resume matching a prior session's prefix chain.
+- **Zero modification of the request** — observe-only hooks; nothing is ever added to or removed from the prompt that goes on the wire.
+
+### Uninstall
+
+```bash
+rm -rf ~/.pi/agent/extensions/pi-cache-match
+```
+
+Configuration knobs (block size, telemetry dir, ids, debug) are in §8.2.
+
+---
+
 ## 0. Visual architecture at a glance
 
 Nine diagrams. Read top-to-bottom; together they tell the entire story before a single formula.
