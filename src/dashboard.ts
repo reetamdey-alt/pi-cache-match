@@ -131,7 +131,12 @@ export class CacheMatchDashboard implements Focusable {
 			return out as CacheMatchEvent;
 		};
 		this.events = args.events.map(sanitize).sort(
-			(a, b) => a.call_index - b.call_index || a.timestamp.localeCompare(b.timestamp),
+			// Chronological first: telemetry files and replays can span multiple
+			// sessions, each restarting call_index at 0 — a call_index-primary
+			// sort interleaves lanes and makes events[last] arbitrary. Real-time
+			// single-session streams are timestamp-monotonic already, so the
+			// call_index tiebreak only orders same-ms bursts within one session.
+			(a, b) => a.timestamp.localeCompare(b.timestamp) || a.call_index - b.call_index,
 		);
 		this.stats = args.stats;
 		this.telemetryFile = args.telemetryFile;
